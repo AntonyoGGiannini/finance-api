@@ -84,7 +84,12 @@ def processar_fatura(
                 ignorados += 1
                 continue
 
-            tipo = "Despesa"
+            # Cashback / estorno em fatura vem como valor negativo = receita
+            if valor_lancamento < 0:
+                tipo = "Receita"
+                valor_lancamento = abs(valor_lancamento)
+            else:
+                tipo = "Despesa"
             funcao = "Crédito"
 
             parcelado, p, pt, nome_lancamento = parse_parcelas(nome_normalizado)
