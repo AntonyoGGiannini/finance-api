@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from datetime import date
 
 import pandas as pd
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 
 from .categorizacao_extrato import processar_extrato
 from .categorizacao_fatura import processar_fatura
@@ -89,9 +89,9 @@ def _ler_arquivo_extrato(arquivo: UploadFile) -> list[dict]:
 
 @app.post("/processar-fatura")
 def processar_fatura_endpoint(
+    conta: str = Query(...),
+    data_vencimento: date = Query(...),
     arquivo: UploadFile = File(...),
-    conta: str = Form(...),
-    data_vencimento: date = Form(...),
 ):
     linhas = _ler_arquivo_fatura(arquivo)
     if not linhas:
@@ -106,8 +106,8 @@ def processar_fatura_endpoint(
 
 @app.post("/processar-extrato")
 def processar_extrato_endpoint(
+    conta: str = Query(...),
     arquivo: UploadFile = File(...),
-    conta: str = Form(...),
 ):
     linhas = _ler_arquivo_extrato(arquivo)
     if not linhas:
