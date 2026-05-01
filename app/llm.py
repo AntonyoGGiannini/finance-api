@@ -1,17 +1,18 @@
-"""Sugestao de categoria via Claude quando nao ha match nas dims."""
+"""Sugestao de categoria via Gemini."""
 import json
 import os
 from typing import Optional
 
-from anthropic import Anthropic
+from google import genai
+from google.genai import types
 
-_client: Optional[Anthropic] = None
+_client: Optional["genai.Client"] = None
 
 
-def _get_client() -> Anthropic:
+def _get_client() -> "genai.Client":
     global _client
     if _client is None:
-        _client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+        _client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
     return _client
 
 
@@ -39,7 +40,7 @@ def sugerir_categoria(
     conta: str,
     taxonomia: list[tuple[str, str]],
 ) -> dict:
-    """Chama Claude para sugerir categoria. Retorna dict com categoria/subcategoria/classe/confianca."""
+    """Chama Gemini para sugerir categoria."""
     client = _get_client()
 
     tax_str = "\n".join(
@@ -55,16 +56,18 @@ def sugerir_categoria(
         f"Taxonomia permitida:\n{tax_str}"
     )
 
-    resp = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=200,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_msg}],
+    resp = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=user_msg,
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            response_mime_type="application/json",
+            max_output_tokens=200,
+            temperature=0.0,
+        ),
     )
 
-    text = resp.content[0].text.strip()
-    if text.startswith("```"):
-        text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+    text = (resp.text or "").strip()
 
     try:
         out = json.loads(text)
