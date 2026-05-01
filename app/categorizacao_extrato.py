@@ -147,9 +147,12 @@ def processar_extrato(linhas: list[dict], conta: str) -> dict:
                     origem_categoria = "llm"
                     revisado = False
                     pendentes += 1
-                except Exception:
+                except Exception as exc:
+                    import traceback
+                    print(f"LLM ERROR for {nome_lancamento}: {type(exc).__name__}: {exc}")
+                    traceback.print_exc()
                     origem_categoria = "llm_erro"
-                    revisado = False
+                    revisado = Falsee
 
             id_lancamento = _gerar_id_lancamento(
                 conta, funcao, tipo, data_lancamento, nome_limpo, valor_lancamento, r
