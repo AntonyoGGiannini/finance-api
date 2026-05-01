@@ -27,6 +27,23 @@ def health():
 
 
 def _ler_arquivo_fatura(arquivo: UploadFile) -> list[dict]:
+    """Le CSV ou XLSX no formato fatura: colunas 'data', 'lançamento', 'valor'."""
+    content = arquivo.file.read()
+    if arquivo.filename.lower().endswith(".csv"):
+        df = pd.read_csv(io.BytesIO(content))
+    elif arquivo.filename.lower().endswith((".xlsx", ".xls")):
+        df = pd.read_excel(io.BytesIO(content))
+    else:
+        raise HTTPException(400, "Formato nao suportado (use .csv ou .xlsx)")
+
+    cols = {c.lower().strip(): c for c in df.columns}
+    if "data" not in cols or "valor" not in cols:
+        raise HTTPException(400, f"CSV deve ter colunas 'data' e 'valor'. Achei: {list(df.columns)}")
+
+    nome_col = cols.get("lançamento") or cols.get("lancamento") or cols.get("descricao")
+    if not nome_col:
+        raise HTTPException(400, "CSV deve ter coluna 'lançamento' ou 'lancamento'")
+
     linhas = []
     for _, row in df.iterrows():
         raw_data = row[cols["data"]]
@@ -49,7 +66,6 @@ def _ler_arquivo_fatura(arquivo: UploadFile) -> list[dict]:
             "valor": row[cols["valor"]],
         })
     return linhas
-
 
 def _ler_arquivo_extrato(arquivo: UploadFile) -> list[dict]:
     """Le CSV do extrato Itau: header ausente, separador ';', UTF-8 BOM."""
