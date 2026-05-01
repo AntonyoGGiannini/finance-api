@@ -1,7 +1,7 @@
 """API FastAPI: endpoints de processamento de fatura e extrato."""
 import io
 from contextlib import asynccontextmanager
-from datetime import date
+from datetime import date, datetime
 
 import pandas as pd
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
@@ -80,9 +80,20 @@ def _ler_arquivo_extrato(arquivo: UploadFile) -> list[dict]:
 @app.post("/processar-fatura")
 def processar_fatura_endpoint(
     conta: str = Query(...),
-    data_vencimento: date = Query(...),
+    data_vencimento: str = Query(...),
     arquivo: UploadFile = File(...),
 ):
+    # Aceita YYYY-MM-DD ou DD/MM/YYYY
+    dv = None
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y"):
+        try:
+            dv = datetime.strptime(data_vencimento, fmt).date().isoformat()
+            break
+        except ValueError:
+            continue
+    if dv is None:
+        raise HTTPException(400, f"data_vencimento invalida: {data_vencimento}. Use YYYY-MM-DD ou DD/MM/YYYY.")
+
     linhas = _ler_arquivo_fatura(arquivo)
     if not linhas:
         return {"inseridos": 0, "ignorados": 0, "sugestoes_pendentes": 0, "lancamentos": []}
@@ -90,7 +101,7 @@ def processar_fatura_endpoint(
     return processar_fatura(
         linhas=linhas,
         conta=conta,
-        data_vencimento=data_vencimento.isoformat(),
+        data_vencimento=dv,
     )
 
 
