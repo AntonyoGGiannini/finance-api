@@ -27,30 +27,20 @@ def health():
 
 
 def _ler_arquivo_fatura(arquivo: UploadFile) -> list[dict]:
-    """Le CSV ou XLSX no formato fatura: colunas 'data', 'lançamento', 'valor'."""
-    content = arquivo.file.read()
-    if arquivo.filename.lower().endswith(".csv"):
-        df = pd.read_csv(io.BytesIO(content))
-    elif arquivo.filename.lower().endswith((".xlsx", ".xls")):
-        df = pd.read_excel(io.BytesIO(content))
-    else:
-        raise HTTPException(400, "Formato nao suportado (use .csv ou .xlsx)")
-
-    cols = {c.lower().strip(): c for c in df.columns}
-    if "data" not in cols or "valor" not in cols:
-        raise HTTPException(400, f"CSV deve ter colunas 'data' e 'valor'. Achei: {list(df.columns)}")
-
-    nome_col = cols.get("lançamento") or cols.get("lancamento") or cols.get("descricao")
-    if not nome_col:
-        raise HTTPException(400, "CSV deve ter coluna 'lançamento' ou 'lancamento'")
-
     linhas = []
     for _, row in df.iterrows():
-        try:
-            data = pd.to_datetime(row[cols["data"]], format="%d/%m/%Y").strftime("%Y-%m-%d")
-        except Exception:
+        raw_data = row[cols["data"]]
+        # Tenta ISO primeiro (YYYY-MM-DD), depois BR (DD/MM/YYYY), depois auto
+        data = None
+        for fmt in ("%Y-%m-%d", "%d/%m/%Y"):
             try:
-                data = pd.to_datetime(row[cols["data"]]).strftime("%Y-%m-%d")
+                data = pd.to_datetime(raw_data, format=fmt).strftime("%Y-%m-%d")
+                break
+            except Exception:
+                continue
+        if data is None:
+            try:
+                data = pd.to_datetime(raw_data).strftime("%Y-%m-%d")
             except Exception:
                 continue
         linhas.append({
