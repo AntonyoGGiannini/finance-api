@@ -201,7 +201,10 @@ def processar_fatura(
                     origem_categoria = "llm"
                     revisado = False
                     pendentes += 1
-                except Exception:
+                except Exception as exc:
+                    import traceback
+                    print(f"LLM ERROR for {nome_lancamento}: {type(exc).__name__}: {exc}")
+                    traceback.print_exc()
                     origem_categoria = "llm_erro"
                     revisado = False
 
