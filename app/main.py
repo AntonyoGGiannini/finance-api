@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from datetime import date, datetime
 
 import pandas as pd
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 
 from .categorizacao_extrato import processar_extrato
 from .categorizacao_fatura import processar_fatura
@@ -25,6 +25,11 @@ app = FastAPI(title="Finance API", version="1.0.0", lifespan=lifespan)
 def health():
     return {"status": "ok"}
 
+class _MockUpload:
+    """Wrapper pra simular UploadFile a partir de bytes raw."""
+    def __init__(self, filename: str, content: bytes):
+        self.filename = filename
+        self.file = io.BytesIO(content)
 
 def _ler_arquivo_fatura(arquivo: UploadFile) -> list[dict]:
     """Le CSV ou XLSX no formato fatura: colunas 'data', 'lançamento', 'valor'."""
@@ -94,10 +99,11 @@ def _ler_arquivo_extrato(arquivo: UploadFile) -> list[dict]:
 
 
 @app.post("/processar-fatura")
-def processar_fatura_endpoint(
+async def processar_fatura_endpoint(
+    request: Request,
     conta: str = Query(...),
     data_vencimento: str = Query(...),
-    arquivo: UploadFile = File(...),
+    filename: str = Query("upload.csv"),
 ):
     # Aceita YYYY-MM-DD ou DD/MM/YYYY
     dv = None
@@ -108,24 +114,27 @@ def processar_fatura_endpoint(
         except ValueError:
             continue
     if dv is None:
-        raise HTTPException(400, f"data_vencimento invalida: {data_vencimento}. Use YYYY-MM-DD ou DD/MM/YYYY.")
+        raise HTTPException(400, f"data_vencimento invalida: {data_vencimento}")
+
+    body = await request.body()
+    arquivo = _MockUpload(filename, body)
 
     linhas = _ler_arquivo_fatura(arquivo)
     if not linhas:
         return {"inseridos": 0, "ignorados": 0, "sugestoes_pendentes": 0, "lancamentos": []}
 
-    return processar_fatura(
-        linhas=linhas,
-        conta=conta,
-        data_vencimento=dv,
-    )
+    return processar_fatura(linhas=linhas, conta=conta, data_vencimento=dv)
 
 
 @app.post("/processar-extrato")
-def processar_extrato_endpoint(
+async def processar_extrato_endpoint(
+    request: Request,
     conta: str = Query(...),
-    arquivo: UploadFile = File(...),
+    filename: str = Query("upload.csv"),
 ):
+    body = await request.body()
+    arquivo = _MockUpload(filename, body)
+
     linhas = _ler_arquivo_extrato(arquivo)
     if not linhas:
         return {"inseridos": 0, "ignorados": 0, "sugestoes_pendentes": 0, "lancamentos": []}
