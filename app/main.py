@@ -9,6 +9,9 @@ from .utils import hash_recorrente
 from contextlib import asynccontextmanager
 from .db import pool
 
+from .parser_extrato import parse_extrato_itau
+from .categorizacao_extrato import classificar_extrato
+
 @asynccontextmanager
 async def lifespan(app):
     pool.open()
@@ -375,3 +378,161 @@ def revisar_parcelado(p: RevisaoParceladoPayload):
             parcelas_atualizadas = cur.rowcount
 
     return {"ok": True, "parcelas_atualizadas": parcelas_atualizadas}
+
+# ─── upload extrato ──────────────────────────────────────────────────────────
+# Adicionar ao main.py — imports adicionais no topo
+
+@app.post("/upload-extrato")
+async def upload_extrato(
+    request: Request,
+    conta: str = Query(...),
+):
+    """
+    Recebe XLS de extrato ITAU via body raw.
+    Não precisa de data_vencimento (extrato não tem).
+    """
+    raw = await request.body()
+    linhas = parse_extrato_itau(raw)
+
+    resultado = {"inseridos": 0, "ignorados": 0, "pendentes": 0}
+
+    with pool.connection() as conn:
+        # resolve conta_id
+        with conn.cursor() as cur:
+            cur.execute(
+                "select id_conta from dim_account where nome_conta = %s", (conta,)
+            )
+            row = cur.fetchone()
+        if not row:
+            return {"erro": f"Conta '{conta}' não encontrada em dim_account"}
+        conta_id = row[0]
+
+        for item in linhas:
+            cls = classificar_extrato(
+                conn,
+                conta=conta,
+                nome_raw=item["lancamento"],
+                valor=item["valor"],
+                data_lancamento=item["data"],
+                linha=item["linha"],
+            )
+
+            if cls["fonte_categoria"] == "pendente":
+                resultado["pendentes"] += 1
+
+            categoria_id = None
+            if cls["categoria"]:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        select id_categoria from dim_categoria
+                        where categoria = %s
+                          and coalesce(subcategoria, '') = coalesce(%s, '')
+                        limit 1
+                        """,
+                        (cls["categoria"], cls["subcategoria"]),
+                    )
+                    r = cur.fetchone()
+                    categoria_id = r[0] if r else None
+
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    insert into fact_lancamento (
+                      hash_natural, data_lancamento, conta_id,
+                      tipo, funcao, nome_original, nome_lancamento, valor, linha_arquivo,
+                      classe, categoria_id, subcategoria, descricao, fonte_categoria,
+                      id_recorrencia
+                    ) values (
+                      %s, %s, %s,
+                      %s, %s, %s, %s, %s, %s,
+                      %s, %s, %s, %s, %s,
+                      %s
+                    )
+                    on conflict (hash_natural) do nothing
+                    """,
+                    (
+                        cls["hash_natural"], cls["data_lancamento"], conta_id,
+                        cls["tipo"], cls["funcao"], cls["nome_original"],
+                        cls["nome_lancamento"], cls["valor"], cls["linha_arquivo"],
+                        cls["classe"], categoria_id, cls["subcategoria"],
+                        cls["descricao"], cls["fonte_categoria"],
+                        cls["id_recorrencia"],
+                    ),
+                )
+                if cur.rowcount:
+                    resultado["inseridos"] += 1
+                else:
+                    resultado["ignorados"] += 1
+
+    # FASE 2: LLM pros pendentes (mesma lógica do upload-fatura, sem filtro por vencimento)
+    if resultado["pendentes"] > 0:
+        from .llm import categorizar_batch
+
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "select categoria, coalesce(subcategoria,'') "
+                    "from dim_categoria order by 1, 2"
+                )
+                taxonomia = cur.fetchall()
+
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    select fl.id, fl.nome_lancamento, fl.tipo, fl.funcao
+                    from fact_lancamento fl
+                    join dim_account da on da.id_conta = fl.conta_id
+                    where da.nome_conta = %s
+                      and fl.fonte_categoria = 'pendente'
+                      and fl.criado_em > now() - interval '5 minutes'
+                    """,
+                    (conta,),
+                )
+                pendentes = cur.fetchall()
+
+        if pendentes:
+            nomes_unicos = list({r[1] for r in pendentes})
+            try:
+                sugestoes = categorizar_batch(
+                    nomes=nomes_unicos,
+                    taxonomia=taxonomia,
+                    contexto={"conta": conta, "tipo": "Despesa", "funcao": "Débito"},
+                )
+                idx = {s["nome"]: s for s in sugestoes}
+
+                with pool.connection() as conn:
+                    for lid, nome, _, _ in pendentes:
+                        sug = idx.get(nome)
+                        if not sug:
+                            continue
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """
+                                update fact_lancamento set
+                                  fonte_categoria = 'llm',
+                                  categoria_id = (
+                                    select id_categoria from dim_categoria
+                                    where categoria = %s
+                                      and coalesce(subcategoria,'') = coalesce(%s,'')
+                                    limit 1
+                                  ),
+                                  subcategoria = %s,
+                                  classe = %s,
+                                  atualizado_em = now()
+                                where id = %s
+                                """,
+                                (
+                                    sug["categoria"],
+                                    sug.get("subcategoria", ""),
+                                    sug.get("subcategoria", ""),
+                                    sug.get("classe", "Variável"),
+                                    lid,
+                                ),
+                            )
+                resultado["categorizados_llm"] = len(pendentes)
+                resultado["pendentes"] = 0
+            except Exception as e:
+                resultado["erro_llm"] = str(e)
+
+    return resultado
