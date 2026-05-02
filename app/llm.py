@@ -35,7 +35,7 @@ def sugerir_categoria(
     res = categorizar_batch(
         nomes=[nome],
         taxonomia=taxonomia,
-        contexto={"tipo": tipo, "funcao": funcao, "conta": conta},
+        contexto={"tipo": tipo, "funcao": funcao, "conta": conta, "valor": valor},
     )
     if not res:
         raise RuntimeError("LLM retornou vazio")
@@ -44,6 +44,22 @@ def sugerir_categoria(
         "categoria": r["categoria"],
         "subcategoria": r.get("subcategoria", ""),
         "classe": r.get("classe", "Variável"),
+    }
+
+
+def _normalizar_item(item: dict, nome_original: str) -> dict:
+    categoria = (item.get("categoria") or "Outros").strip()
+    subcategoria = (item.get("subcategoria") or "").strip()
+    classe = (item.get("classe") or "Variável").strip()
+
+    if classe not in {"Fixa", "Variável"}:
+        classe = "Variável"
+
+    return {
+        "nome": item.get("nome") or nome_original,
+        "categoria": categoria,
+        "subcategoria": subcategoria,
+        "classe": classe,
     }
 
 
@@ -63,7 +79,9 @@ def categorizar_batch(
     if ctx:
         cabecalho_ctx = (
             f"Contexto: conta={ctx.get('conta', '?')}, "
-            f"tipo={ctx.get('tipo', '?')}, funcao={ctx.get('funcao', '?')}.\n"
+            f"tipo={ctx.get('tipo', '?')}, "
+            f"funcao={ctx.get('funcao', '?')}, "
+            f"valor={ctx.get('valor', '?')}.\n"
         )
 
     prompt = f"""Você é um categorizador de lançamentos financeiros pessoais (Brasil).
@@ -72,9 +90,13 @@ def categorizar_batch(
 {_formatar_taxonomia(taxonomia)}
 
 Para cada nome de lançamento abaixo, retorne categoria, subcategoria e classe.
+Regras:
 - classe = "Fixa" se for assinatura/recorrente típica (streaming, plano, mensalidade); senão "Variável".
 - Se não souber subcategoria, use "".
 - Se não souber categoria, use "Outros".
+- Não invente categoria/subcategoria fora da taxonomia.
+- Retorne exatamente um item para cada nome recebido.
+- Preserve o campo "nome" exatamente como recebido.
 
 Retorne APENAS JSON array, sem markdown, no formato exato:
 [{{"nome": "...", "categoria": "...", "subcategoria": "...", "classe": "..."}}]
@@ -85,3 +107,29 @@ Lançamentos:
 
     resp = _get_client().models.generate_content(
         model="gemini-2.5-flash",
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0,
+            response_mime_type="application/json",
+        ),
+    )
+
+    texto = (resp.text or "").strip()
+    if not texto:
+        raise RuntimeError("Gemini retornou resposta vazia")
+
+    try:
+        data = json.loads(texto)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Resposta do Gemini não veio em JSON válido: {texto}") from e
+
+    if not isinstance(data, list):
+        raise RuntimeError(f"Resposta inválida: esperado JSON array, recebido {type(data).__name__}")
+
+    # Garante cardinalidade 1:1 com a entrada
+    saida = []
+    for i, nome_original in enumerate(nomes):
+        item = data[i] if i < len(data) and isinstance(data[i], dict) else {}
+        saida.append(_normalizar_item(item, nome_original))
+
+    return saida
