@@ -1,0 +1,108 @@
+from datetime import date
+from .db import pool
+from .utils import normalizar_nome, parse_parcelas, hash_parcelado, hash_recorrente
+
+
+def classificar_lancamento(conn, conta: str, nome_raw: str,
+                           valor: float, data_lancamento: str) -> dict:
+    """Classifica 1 lançamento. Retorna dict com classe + ids + categoria."""
+    nome = normalizar_nome(nome_raw)
+    eh_parcelado, p_atual, p_totais, nome_limpo = parse_parcelas(nome)
+
+    if eh_parcelado:
+        valor_parcela = round(float(valor), 2)
+        # data_inicio = data desta parcela menos (parcela_atual - 1) meses
+        data_inicio = _voltar_meses(data_lancamento, p_atual - 1)
+        id_parc = hash_parcelado(conta, nome_limpo, data_inicio,
+                                 p_totais, valor_parcela)
+        cat = _upsert_parcelado(conn, id_parc, conta, nome_limpo,
+                                data_inicio, p_totais, valor_parcela)
+        return {
+            "classe": "Variável",
+            "id_parcelamento": id_parc,
+            "id_recorrencia": None,
+            "nome_lancamento": nome_limpo,
+            "parcela_atual": p_atual,
+            "parcelas_totais": p_totais,
+            **cat,
+        }
+
+    # Não parcelado: tenta recorrente (lookup, nunca cria)
+    rec = _lookup_recorrente(conn, conta, nome)
+    if rec:
+        return {
+            "classe": "Fixa",
+            "id_parcelamento": None,
+            "id_recorrencia": rec["id"],
+            "nome_lancamento": nome,
+            "parcela_atual": None,
+            "parcelas_totais": None,
+            "categoria": rec["categoria"],
+            "subcategoria": rec["subcategoria"],
+            "descricao": rec["descricao"],
+        }
+
+    # Default: variável sem categoria (vai pra revisão / LLM)
+    return {
+        "classe": "Variável",
+        "id_parcelamento": None,
+        "id_recorrencia": None,
+        "nome_lancamento": nome,
+        "parcela_atual": None,
+        "parcelas_totais": None,
+        "categoria": None,
+        "subcategoria": None,
+        "descricao": None,
+    }
+
+
+def _upsert_parcelado(conn, id_parc, conta, nome, data_inicio,
+                      p_totais, valor_parcela) -> dict:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            insert into dim_lancamentos_parcelados
+              (id, conta, nome_lancamento, data_inicio, parcelas_totais, valor_parcela)
+            values (%s, %s, %s, %s, %s, %s)
+            on conflict (id) do nothing
+            returning categoria, subcategoria, descricao
+            """,
+            (id_parc, conta, nome, data_inicio, p_totais, valor_parcela),
+        )
+        row = cur.fetchone()
+        if row:
+            return {"categoria": row[0], "subcategoria": row[1], "descricao": row[2]}
+        # já existia: busca categoria atual
+        cur.execute(
+            "select categoria, subcategoria, descricao "
+            "from dim_lancamentos_parcelados where id = %s",
+            (id_parc,),
+        )
+        r = cur.fetchone()
+        return {"categoria": r[0], "subcategoria": r[1], "descricao": r[2]}
+
+
+def _lookup_recorrente(conn, conta: str, nome: str) -> dict | None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            select id, categoria, subcategoria, descricao
+            from dim_lancamentos_recorrentes
+            where conta = %s and nome_lancamento = %s and ativo = true
+            """,
+            (conta, nome),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    return {"id": row[0], "categoria": row[1],
+            "subcategoria": row[2], "descricao": row[3]}
+
+
+def _voltar_meses(data_iso: str, n: int) -> str:
+    y, m, d = map(int, data_iso.split("-"))
+    m -= n
+    while m <= 0:
+        m += 12
+        y -= 1
+    return f"{y:04d}-{m:02d}-01"
