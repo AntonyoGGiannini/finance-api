@@ -114,7 +114,80 @@ async def upload_fatura(
                     resultado["inseridos"] += 1
                 else:
                     resultado["ignorados"] += 1
+                    
+    # FASE 2: categoriza pendentes via Gemini em batch
+    if resultado["pendentes"] > 0:
+        from .llm import categorizar_batch
 
+        with pool.connection() as conn:
+            # busca taxonomia
+            with conn.cursor() as cur:
+                cur.execute(
+                    "select categoria, coalesce(subcategoria,'') "
+                    "from dim_categoria order by 1, 2"
+                )
+                taxonomia = cur.fetchall()
+
+            # busca lançamentos pendentes desta fatura (pelo vencimento + conta)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    select fl.id, fl.nome_lancamento
+                    from fact_lancamento fl
+                    join dim_account da on da.id_conta = fl.conta_id
+                    where da.nome_conta = %s
+                      and fl.data_vencimento = %s
+                      and fl.fonte_categoria = 'pendente'
+                    """,
+                    (conta, data_vencimento),
+                )
+                pendentes = cur.fetchall()  # [(id, nome), ...]
+
+        if pendentes:
+            nomes_unicos = list({r[1] for r in pendentes})
+            try:
+                sugestoes = categorizar_batch(
+                    nomes=nomes_unicos,
+                    taxonomia=taxonomia,
+                    contexto={"conta": conta, "tipo": "Despesa", "funcao": "Crédito"},
+                )
+                # índice por nome
+                idx = {s["nome"]: s for s in sugestoes}
+
+                with pool.connection() as conn:
+                    for lid, nome in pendentes:
+                        sug = idx.get(nome)
+                        if not sug:
+                            continue
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """
+                                update fact_lancamento set
+                                  fonte_categoria = 'llm',
+                                  categoria_id = (
+                                    select id_categoria from dim_categoria
+                                    where categoria = %s
+                                      and coalesce(subcategoria,'') = coalesce(%s,'')
+                                    limit 1
+                                  ),
+                                  subcategoria = %s,
+                                  classe = %s,
+                                  atualizado_em = now()
+                                where id = %s
+                                """,
+                                (
+                                    sug["categoria"],
+                                    sug.get("subcategoria", ""),
+                                    sug.get("subcategoria", ""),
+                                    sug.get("classe", "Variável"),
+                                    lid,
+                                ),
+                            )
+                resultado["categorizados_llm"] = len(pendentes)
+                resultado["pendentes"] = 0
+            except Exception as e:
+                resultado["erro_llm"] = str(e)
+                
     return resultado
 
 
