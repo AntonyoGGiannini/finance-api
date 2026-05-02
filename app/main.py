@@ -289,3 +289,89 @@ def pendentes(limit: int = 50):
         {"nome": r[0], "conta": r[1], "ocorrencias": r[2], "valor_total": float(r[3])}
         for r in rows
     ]
+
+# ─── revisar lançamento ───────────────────────────────────────────────────────
+
+class RevisaoPayload(BaseModel):
+    hash_natural: str
+    categoria: str
+    subcategoria: str | None = None
+    descricao: str | None = None
+
+@app.post("/revisar-lancamento")
+def revisar_lancamento(p: RevisaoPayload):
+    with pool.connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            update fact_lancamento set
+              categoria_id = (
+                select id_categoria from dim_categoria
+                where categoria = %s
+                  and coalesce(subcategoria,'') = coalesce(%s,'')
+                limit 1
+              ),
+              subcategoria  = %s,
+              descricao     = %s,
+              fonte_categoria = 'manual',
+              revisado_em   = now(),
+              atualizado_em = now()
+            where hash_natural = %s
+            returning id
+            """,
+            (p.categoria, p.subcategoria, p.subcategoria, p.descricao, p.hash_natural),
+        )
+        row = cur.fetchone()
+    if not row:
+        return {"erro": "lançamento não encontrado"}
+    return {"ok": True, "id": row[0]}
+
+
+# ─── revisar parcelado ────────────────────────────────────────────────────────
+
+class RevisaoParceladoPayload(BaseModel):
+    id_parcelamento: str
+    categoria: str
+    subcategoria: str | None = None
+    descricao: str | None = None
+
+@app.post("/revisar-parcelado")
+def revisar_parcelado(p: RevisaoParceladoPayload):
+    with pool.connection() as conn:
+        # atualiza a dim (a "compra-mãe")
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                update dim_lancamentos_parcelados set
+                  categoria     = %s,
+                  subcategoria  = %s,
+                  descricao     = %s,
+                  atualizado_em = now()
+                where id = %s
+                """,
+                (p.categoria, p.subcategoria, p.descricao, p.id_parcelamento),
+            )
+
+        # propaga pra todas as parcelas no fact
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                update fact_lancamento set
+                  categoria_id = (
+                    select id_categoria from dim_categoria
+                    where categoria = %s
+                      and coalesce(subcategoria,'') = coalesce(%s,'')
+                    limit 1
+                  ),
+                  subcategoria    = %s,
+                  descricao       = %s,
+                  fonte_categoria = 'manual',
+                  revisado_em     = now(),
+                  atualizado_em   = now()
+                where id_parcelamento = %s
+                returning id
+                """,
+                (p.categoria, p.subcategoria, p.subcategoria, p.descricao, p.id_parcelamento),
+            )
+            parcelas_atualizadas = cur.rowcount
+
+    return {"ok": True, "parcelas_atualizadas": parcelas_atualizadas}
