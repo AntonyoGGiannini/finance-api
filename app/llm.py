@@ -47,22 +47,6 @@ def sugerir_categoria(
     }
 
 
-def _normalizar_item(item: dict, nome_original: str) -> dict:
-    categoria = (item.get("categoria") or "Outros").strip()
-    subcategoria = (item.get("subcategoria") or "").strip()
-    classe = (item.get("classe") or "Variável").strip()
-
-    if classe not in {"Fixa", "Variável"}:
-        classe = "Variável"
-
-    return {
-        "nome": item.get("nome") or nome_original,
-        "categoria": categoria,
-        "subcategoria": subcategoria,
-        "classe": classe,
-    }
-
-
 def categorizar_batch(
     nomes: list[str],
     taxonomia: list[tuple[str, str]],
@@ -79,9 +63,7 @@ def categorizar_batch(
     if ctx:
         cabecalho_ctx = (
             f"Contexto: conta={ctx.get('conta', '?')}, "
-            f"tipo={ctx.get('tipo', '?')}, "
-            f"funcao={ctx.get('funcao', '?')}, "
-            f"valor={ctx.get('valor', '?')}.\n"
+            f"tipo={ctx.get('tipo', '?')}, funcao={ctx.get('funcao', '?')}.\n"
         )
 
     prompt = f"""Você é um categorizador de lançamentos financeiros pessoais (Brasil).
@@ -90,13 +72,9 @@ def categorizar_batch(
 {_formatar_taxonomia(taxonomia)}
 
 Para cada nome de lançamento abaixo, retorne categoria, subcategoria e classe.
-Regras:
 - classe = "Fixa" se for assinatura/recorrente típica (streaming, plano, mensalidade); senão "Variável".
 - Se não souber subcategoria, use "".
 - Se não souber categoria, use "Outros".
-- Não invente categoria/subcategoria fora da taxonomia.
-- Retorne exatamente um item para cada nome recebido.
-- Preserve o campo "nome" exatamente como recebido.
 
 Retorne APENAS JSON array, sem markdown, no formato exato:
 [{{"nome": "...", "categoria": "...", "subcategoria": "...", "classe": "..."}}]
@@ -124,12 +102,24 @@ Lançamentos:
         raise RuntimeError(f"Resposta do Gemini não veio em JSON válido: {texto}") from e
 
     if not isinstance(data, list):
-        raise RuntimeError(f"Resposta inválida: esperado JSON array, recebido {type(data).__name__}")
+        raise RuntimeError(
+            f"Resposta inválida: esperado JSON array, recebido {type(data).__name__}"
+        )
 
-    # Garante cardinalidade 1:1 com a entrada
     saida = []
     for i, nome_original in enumerate(nomes):
         item = data[i] if i < len(data) and isinstance(data[i], dict) else {}
-        saida.append(_normalizar_item(item, nome_original))
+        saida.append(
+            {
+                "nome": item.get("nome") or nome_original,
+                "categoria": (item.get("categoria") or "Outros").strip(),
+                "subcategoria": (item.get("subcategoria") or "").strip(),
+                "classe": (
+                    item.get("classe")
+                    if item.get("classe") in {"Fixa", "Variável"}
+                    else "Variável"
+                ),
+            }
+        )
 
     return saida
