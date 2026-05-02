@@ -1,6 +1,9 @@
 from fastapi import FastAPI, Request, Query
 from pydantic import BaseModel
 
+import json
+from datetime import timedelta
+
 from .db import pool
 from .parser import parse_fatura_csv
 from .categorizacao import classificar_lancamento
@@ -536,3 +539,268 @@ async def upload_extrato(
                 resultado["erro_llm"] = str(e)
 
     return resultado
+
+# Adicionar ao app/main.py — endpoint de dados pro squad
+
+@app.get("/squad-data")
+def squad_data():
+    """
+    Retorna JSON consolidado pros 4 agentes do squad mensal.
+    Janela: últimos 35 dias (5 semanas) a partir da data mais recente em fact_lancamento.
+    Janela comparativa: 105 dias anteriores ao período (3 períodos de 35d pra trimestre).
+    """
+    with pool.connection() as conn:
+        # 1. Define janela
+        with conn.cursor() as cur:
+            cur.execute("select max(data_lancamento) from fact_lancamento")
+            ref = cur.fetchone()[0]
+        if not ref:
+            return {"erro": "sem dados em fact_lancamento"}
+
+        out = {
+            "periodo": {
+                "ref_max": str(ref),
+                "inicio": str(ref - __import__('datetime').timedelta(days=34)),
+                "fim": str(ref),
+                "comparativo_inicio": str(ref - __import__('datetime').timedelta(days=139)),
+                "comparativo_fim": str(ref - __import__('datetime').timedelta(days=35)),
+            }
+        }
+
+        # 2. Totais do período (receita, despesa, saldo)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                select tipo,
+                       coalesce(sum(valor) filter (where classe != 'Investimento'), 0) as total,
+                       coalesce(sum(valor) filter (where classe = 'Fixa'), 0) as fixa,
+                       coalesce(sum(valor) filter (where classe = 'Variável'), 0) as variavel
+                from fact_lancamento
+                where data_lancamento >= %s and data_lancamento <= %s
+                group by tipo
+                """,
+                (out["periodo"]["inicio"], out["periodo"]["fim"]),
+            )
+            out["totais"] = [
+                {"tipo": r[0], "total": float(r[1]),
+                 "fixa": float(r[2]), "variavel": float(r[3])}
+                for r in cur.fetchall()
+            ]
+
+        # 3. Top categorias do período (com comparativo trimestre)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                with periodo as (
+                  select dc.categoria, dc.subcategoria,
+                         sum(fl.valor) as total_periodo
+                  from fact_lancamento fl
+                  join dim_categoria dc on dc.id_categoria = fl.categoria_id
+                  where fl.tipo = 'Despesa' and fl.classe != 'Investimento'
+                    and fl.data_lancamento between %s and %s
+                  group by 1, 2
+                ),
+                trimestre as (
+                  select dc.categoria, dc.subcategoria,
+                         sum(fl.valor) / 3.0 as media_periodo
+                  from fact_lancamento fl
+                  join dim_categoria dc on dc.id_categoria = fl.categoria_id
+                  where fl.tipo = 'Despesa' and fl.classe != 'Investimento'
+                    and fl.data_lancamento between %s and %s
+                  group by 1, 2
+                )
+                select p.categoria, p.subcategoria, p.total_periodo,
+                       coalesce(t.media_periodo, 0) as media_3m
+                from periodo p
+                left join trimestre t using (categoria, subcategoria)
+                order by p.total_periodo desc
+                limit 15
+                """,
+                (out["periodo"]["inicio"], out["periodo"]["fim"],
+                 out["periodo"]["comparativo_inicio"], out["periodo"]["comparativo_fim"]),
+            )
+            out["categorias"] = [
+                {"categoria": r[0], "subcategoria": r[1],
+                 "total": float(r[2]), "media_3m": float(r[3]),
+                 "variacao_pct": round((float(r[2]) - float(r[3])) / float(r[3]) * 100, 1)
+                                if float(r[3]) > 0 else None}
+                for r in cur.fetchall()
+            ]
+
+        # 4. Top 10 maiores gastos individuais
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                select fl.data_lancamento, fl.nome_lancamento, fl.valor,
+                       dc.categoria, dc.subcategoria, da.nome_conta
+                from fact_lancamento fl
+                left join dim_categoria dc on dc.id_categoria = fl.categoria_id
+                join dim_account da on da.id_conta = fl.conta_id
+                where fl.tipo = 'Despesa' and fl.classe != 'Investimento'
+                  and fl.data_lancamento between %s and %s
+                order by fl.valor desc
+                limit 10
+                """,
+                (out["periodo"]["inicio"], out["periodo"]["fim"]),
+            )
+            out["maiores_gastos"] = [
+                {"data": str(r[0]), "nome": r[1], "valor": float(r[2]),
+                 "categoria": r[3], "subcategoria": r[4], "conta": r[5]}
+                for r in cur.fetchall()
+            ]
+
+        # 5. Recorrentes ativos (assinaturas)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                select dlr.nome_lancamento, dlr.categoria, dlr.subcategoria,
+                       dlr.valor_referencia,
+                       count(fl.id) as ocorrencias_periodo,
+                       coalesce(sum(fl.valor), 0) as total_periodo
+                from dim_lancamentos_recorrentes dlr
+                left join fact_lancamento fl on fl.id_recorrencia = dlr.id
+                  and fl.data_lancamento between %s and %s
+                where dlr.ativo = true
+                group by 1, 2, 3, 4
+                order by total_periodo desc
+                """,
+                (out["periodo"]["inicio"], out["periodo"]["fim"]),
+            )
+            out["recorrentes"] = [
+                {"nome": r[0], "categoria": r[1], "subcategoria": r[2],
+                 "valor_referencia": float(r[3]) if r[3] else None,
+                 "ocorrencias": r[4], "total_periodo": float(r[5])}
+                for r in cur.fetchall()
+            ]
+
+        # 6. Parcelados ativos (com horizonte)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                select dlp.nome_lancamento, dlp.parcelas_totais, dlp.valor_parcela,
+                       dlp.data_inicio, dlp.categoria,
+                       count(fl.id) as parcelas_pagas,
+                       (dlp.parcelas_totais - count(fl.id)) as parcelas_restantes
+                from dim_lancamentos_parcelados dlp
+                left join fact_lancamento fl on fl.id_parcelamento = dlp.id
+                group by 1, 2, 3, 4, 5, dlp.id
+                having (dlp.parcelas_totais - count(fl.id)) > 0
+                order by dlp.valor_parcela * (dlp.parcelas_totais - count(fl.id)) desc
+                """,
+            )
+            out["parcelados_ativos"] = [
+                {"nome": r[0], "parcelas_totais": r[1],
+                 "valor_parcela": float(r[2]), "data_inicio": str(r[3]),
+                 "categoria": r[4], "parcelas_pagas": r[5],
+                 "parcelas_restantes": r[6],
+                 "compromisso_restante": float(r[2]) * r[6]}
+                for r in cur.fetchall()
+            ]
+
+        # 7. Frequência de gastos variáveis (top categorias por nº de ocorrências)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                select dc.categoria, dc.subcategoria,
+                       count(*) as ocorrencias,
+                       sum(fl.valor) as total
+                from fact_lancamento fl
+                join dim_categoria dc on dc.id_categoria = fl.categoria_id
+                where fl.tipo = 'Despesa' and fl.classe = 'Variável'
+                  and fl.data_lancamento between %s and %s
+                group by 1, 2
+                having count(*) >= 3
+                order by ocorrencias desc
+                limit 15
+                """,
+                (out["periodo"]["inicio"], out["periodo"]["fim"]),
+            )
+            out["frequencia_variaveis"] = [
+                {"categoria": r[0], "subcategoria": r[1],
+                 "ocorrencias": r[2], "total": float(r[3])}
+                for r in cur.fetchall()
+            ]
+
+        # 8. Investimentos do período (aplicações vs resgates vs proventos)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                select fl.subcategoria, fl.tipo,
+                       sum(fl.valor) as total,
+                       count(*) as ocorrencias
+                from fact_lancamento fl
+                join dim_categoria dc on dc.id_categoria = fl.categoria_id
+                where fl.data_lancamento between %s and %s
+                  and (dc.categoria = 'Investimentos'
+                       or dc.subcategoria in ('Juros Recebidos', 'Dividendos'))
+                group by 1, 2
+                order by total desc
+                """,
+                (out["periodo"]["inicio"], out["periodo"]["fim"]),
+            )
+            out["investimentos"] = [
+                {"subcategoria": r[0], "tipo": r[1],
+                 "total": float(r[2]), "ocorrencias": r[3]}
+                for r in cur.fetchall()
+            ]
+
+        # 9. Saldo apertado: dias com saldo bancário baixo
+        # (Aproximação: dias com saldo abaixo de 10% da maior receita do período)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                select max(valor) as maior_receita
+                from fact_lancamento
+                where tipo = 'Receita' and classe != 'Investimento'
+                  and data_lancamento between %s and %s
+                """,
+                (out["periodo"]["inicio"], out["periodo"]["fim"]),
+            )
+            r = cur.fetchone()
+            out["maior_receita_periodo"] = float(r[0]) if r and r[0] else 0
+
+        # 10. Posições de investimento (vazia se tabela ainda não populada)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                select classe_ativo, count(*) as ativos,
+                       sum(mtm) as patrimonio
+                from posicoes
+                where data_ref = (select max(data_ref) from posicoes)
+                group by 1
+                """
+            )
+            out["posicoes_atuais"] = [
+                {"classe": r[0], "ativos": r[1], "patrimonio": float(r[2]) if r[2] else 0}
+                for r in cur.fetchall()
+            ]
+
+    return out
+
+# Adicionar ao app/main.py — persiste output dos agentes em `analises`
+
+class AnalisePayload(BaseModel):
+    agente: str  # 'diagnostico' | 'habitos' | 'carteira' | 'protecao' | 'consolidado'
+    mes_ref: str  # YYYY-MM-DD (1º dia do mês analisado)
+    resumo: str
+    payload: dict | None = None
+
+
+@app.post("/salvar-analise")
+def salvar_analise(p: AnalisePayload):
+    with pool.connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            insert into analises (agente, mes_ref, resumo, payload)
+            values (%s, %s, %s, %s)
+            on conflict (agente, mes_ref) do update set
+              resumo = excluded.resumo,
+              payload = excluded.payload,
+              criado_em = now()
+            returning id
+            """,
+            (p.agente, p.mes_ref, p.resumo,
+             __import__('json').dumps(p.payload) if p.payload else None),
+        )
+        rid = cur.fetchone()[0]
+    return {"ok": True, "id": rid}
