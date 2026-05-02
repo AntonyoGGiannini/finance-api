@@ -1,142 +1,98 @@
-"""API FastAPI: endpoints de processamento de fatura e extrato."""
-import io
-from contextlib import asynccontextmanager
-from datetime import date, datetime
+from fastapi import FastAPI, Request, Query
+from pydantic import BaseModel
+from .db import pool
+from .utils import hash_recorrente
+from .categorizacao import classificar_lancamento
+from .leitor import parse_arquivo  # já existe no teu projeto
 
-import pandas as pd
-from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
-
-from .categorizacao_extrato import processar_extrato
-from .categorizacao_fatura import processar_fatura
-from .db import init_pool, close_pool
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    init_pool()
-    yield
-    close_pool()
-
-
-app = FastAPI(title="Finance API", version="1.0.0", lifespan=lifespan)
+app = FastAPI()
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
-
-class _MockUpload:
-    """Wrapper pra simular UploadFile a partir de bytes raw."""
-    def __init__(self, filename: str, content: bytes):
-        self.filename = filename
-        self.file = io.BytesIO(content)
-
-def _ler_arquivo_fatura(arquivo: UploadFile) -> list[dict]:
-    """Le CSV ou XLSX no formato fatura: colunas 'data', 'lançamento', 'valor'."""
-    content = arquivo.file.read()
-    if arquivo.filename.lower().endswith(".csv"):
-        df = pd.read_csv(io.BytesIO(content))
-    elif arquivo.filename.lower().endswith((".xlsx", ".xls")):
-        df = pd.read_excel(io.BytesIO(content))
-    else:
-        raise HTTPException(400, "Formato nao suportado (use .csv ou .xlsx)")
-
-    cols = {c.lower().strip(): c for c in df.columns}
-    if "data" not in cols or "valor" not in cols:
-        raise HTTPException(400, f"CSV deve ter colunas 'data' e 'valor'. Achei: {list(df.columns)}")
-
-    nome_col = cols.get("lançamento") or cols.get("lancamento") or cols.get("descricao")
-    if not nome_col:
-        raise HTTPException(400, "CSV deve ter coluna 'lançamento' ou 'lancamento'")
-
-    linhas = []
-    for _, row in df.iterrows():
-        raw_data = row[cols["data"]]
-        # Tenta ISO primeiro (YYYY-MM-DD), depois BR (DD/MM/YYYY), depois auto
-        data = None
-        for fmt in ("%Y-%m-%d", "%d/%m/%Y"):
-            try:
-                data = pd.to_datetime(raw_data, format=fmt).strftime("%Y-%m-%d")
-                break
-            except Exception:
-                continue
-        if data is None:
-            try:
-                data = pd.to_datetime(raw_data).strftime("%Y-%m-%d")
-            except Exception:
-                continue
-        linhas.append({
-            "data": data,
-            "lancamento": row[nome_col],
-            "valor": row[cols["valor"]],
-        })
-    return linhas
-
-def _ler_arquivo_extrato(arquivo: UploadFile) -> list[dict]:
-    """Le CSV do extrato Itau: header ausente, separador ';', UTF-8 BOM."""
-    content = arquivo.file.read()
-    if not arquivo.filename.lower().endswith(".csv"):
-        raise HTTPException(400, "Extrato deve ser CSV")
-
-    df = pd.read_csv(io.BytesIO(content), header=None, encoding="utf-8-sig")
-    df = df[0].str.strip('"').str.split(";", expand=True)
-    df.columns = ["data", "lancamento", "valor"]
-    df["valor"] = (
-        df["valor"]
-        .str.replace(".", "", regex=False)
-        .str.replace(",", ".", regex=False)
-        .astype(float)
-    )
-
-    linhas = []
-    for _, row in df.iterrows():
-        try:
-            data = pd.to_datetime(row["data"], format="%d/%m/%Y").strftime("%Y-%m-%d")
-        except Exception:
-            continue
-        linhas.append({"data": data, "lancamento": row["lancamento"], "valor": row["valor"]})
-    return linhas
+    return {"ok": True}
 
 
-@app.post("/processar-fatura")
-async def processar_fatura_endpoint(
+@app.post("/upload-fatura")
+async def upload_fatura(
     request: Request,
     conta: str = Query(...),
     data_vencimento: str = Query(...),
-    filename: str = Query("upload.csv"),
 ):
-    # Aceita YYYY-MM-DD ou DD/MM/YYYY
-    dv = None
-    for fmt in ("%Y-%m-%d", "%d/%m/%Y"):
-        try:
-            dv = datetime.strptime(data_vencimento, fmt).date().isoformat()
-            break
-        except ValueError:
-            continue
-    if dv is None:
-        raise HTTPException(400, f"data_vencimento invalida: {data_vencimento}")
+    raw = await request.body()
+    linhas = parse_arquivo(raw)  # lista de dicts {data, lancamento, valor}
 
-    body = await request.body()
-    arquivo = _MockUpload(filename, body)
+    resultado = {"inseridos": 0, "ignorados": 0, "pendentes_revisao": 0}
 
-    linhas = _ler_arquivo_fatura(arquivo)
-    if not linhas:
-        return {"inseridos": 0, "ignorados": 0, "sugestoes_pendentes": 0, "lancamentos": []}
+    with pool.connection() as conn:
+        for item in linhas:
+            try:
+                cls = classificar_lancamento(
+                    conn,
+                    conta=conta,
+                    nome_raw=str(item["lancamento"]),
+                    valor=float(item["valor"]),
+                    data_lancamento=item["data"],
+                )
+            except Exception:
+                resultado["ignorados"] += 1
+                continue
 
-    return processar_fatura(linhas=linhas, conta=conta, data_vencimento=dv)
+            if cls["categoria"] is None:
+                resultado["pendentes_revisao"] += 1
+
+            # TODO: insert em fact_lancamento usando cls + dados do item
+            resultado["inseridos"] += 1
+
+    return resultado
 
 
-@app.post("/processar-extrato")
-async def processar_extrato_endpoint(
-    request: Request,
-    conta: str = Query(...),
-    filename: str = Query("upload.csv"),
-):
-    body = await request.body()
-    arquivo = _MockUpload(filename, body)
+class RecorrentePayload(BaseModel):
+    conta: str
+    nome_lancamento: str
+    categoria: str
+    subcategoria: str | None = None
+    descricao: str | None = None
+    valor_referencia: float | None = None
 
-    linhas = _ler_arquivo_extrato(arquivo)
-    if not linhas:
-        return {"inseridos": 0, "ignorados": 0, "sugestoes_pendentes": 0, "lancamentos": []}
 
-    return processar_extrato(linhas=linhas, conta=conta)
+@app.post("/marcar-recorrente")
+def marcar_recorrente(p: RecorrentePayload):
+    rid = hash_recorrente(p.conta, p.nome_lancamento)
+    with pool.connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            insert into dim_lancamentos_recorrentes
+              (id, conta, nome_lancamento, valor_referencia,
+               categoria, subcategoria, descricao)
+            values (%s, %s, %s, %s, %s, %s, %s)
+            on conflict (conta, nome_lancamento) do update set
+              categoria = excluded.categoria,
+              subcategoria = excluded.subcategoria,
+              descricao = excluded.descricao,
+              valor_referencia = excluded.valor_referencia,
+              atualizado_em = now()
+            """,
+            (rid, p.conta, p.nome_lancamento, p.valor_referencia,
+             p.categoria, p.subcategoria, p.descricao),
+        )
+    return {"ok": True, "id": rid}
+
+
+@app.get("/pendentes-revisao")
+def pendentes_revisao(limit: int = 50):
+    """Lista lançamentos sem categoria — alimenta a interface de marcar recorrente."""
+    with pool.connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            select distinct nome_lancamento, conta, count(*) as ocorrencias
+            from fact_lancamento
+            where categoria is null and id_parcelamento is null
+            group by 1, 2
+            order by 3 desc
+            limit %s
+            """,
+            (limit,),
+        )
+        rows = cur.fetchall()
+    return [{"nome": r[0], "conta": r[1], "ocorrencias": r[2]} for r in rows]
