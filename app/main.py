@@ -6,8 +6,16 @@ from .parser import parse_fatura_csv
 from .categorizacao import classificar_lancamento
 from .utils import hash_recorrente
 
-app = FastAPI()
+from contextlib import asynccontextmanager
+from .db import pool
 
+@asynccontextmanager
+async def lifespan(app):
+    pool.open()
+    yield
+    pool.close()
+
+app = FastAPI(lifespan=lifespan)
 
 # ─── health ──────────────────────────────────────────────────────────────────
 
