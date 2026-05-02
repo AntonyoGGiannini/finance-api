@@ -46,20 +46,19 @@ def _carregar_taxonomia(conn) -> list[tuple[str, str]]:
         )
         return cur.fetchall()
 
-
 def processar_extrato(linhas: list[dict], conta: str) -> dict:
-    """linhas: lista de dicts com chaves 'data', 'lancamento', 'valor'.
-    Valores positivos = receita, negativos = despesa.
-    """
     inseridos = 0
     ignorados = 0
     pendentes = 0
     detalhes = []
     funcao = "Débito"
 
+    registros = []
+
     with pool.connection() as conn:
         taxonomia = _carregar_taxonomia(conn)
 
+        # FASE 1: parse + lookup determinístico
         for r, item in enumerate(linhas, start=1):
             try:
                 data_lancamento = item["data"]
@@ -81,7 +80,6 @@ def processar_extrato(linhas: list[dict], conta: str) -> dict:
             id_recorrencia = None
             contexto = None
 
-            # Tentativa 1: recorrencia (Debito)
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -103,10 +101,8 @@ def processar_extrato(linhas: list[dict], conta: str) -> dict:
                 id_recorrencia, categoria, subcategoria, descricao = row
                 contexto = 5
             elif eh_pix:
-                # PIX sem recorrencia: deixa pra ver via LLM
                 contexto = 3
             else:
-                # Tentativa 2: dim_categoria_lancamento (Debito)
                 with conn.cursor() as cur:
                     cur.execute(
                         """
@@ -121,43 +117,78 @@ def processar_extrato(linhas: list[dict], conta: str) -> dict:
                         (conta, nome_limpo),
                     )
                     row = cur.fetchone()
-
                 if row:
                     categoria, subcategoria, descricao = row
                     contexto = 4
                 else:
                     contexto = 3
 
-            # Estrategia B: LLM se vazio
-            origem_categoria = "historico"
-            revisado = True
-            if not categoria:
-                try:
-                    sug = sugerir_categoria(
-                        nome=nome_limpo,
-                        valor=valor_lancamento,
-                        tipo=tipo,
-                        funcao=funcao,
-                        conta=conta,
+            registros.append({
+                "linha": r,
+                "data_lancamento": data_lancamento,
+                "data_vencimento": data_vencimento,
+                "nome_limpo": nome_limpo,
+                "valor_lancamento": valor_lancamento,
+                "tipo": tipo,
+                "categoria": categoria,
+                "subcategoria": subcategoria,
+                "descricao": descricao,
+                "classe": classe,
+                "id_recorrencia": id_recorrencia,
+                "contexto": contexto,
+                "origem_categoria": "historico",
+                "revisado": True,
+            })
+
+        # FASE 2: batch LLM, separado por tipo (Receita vs Despesa)
+        from .llm import categorizar_batch
+        mapa_llm = {}  # chave: (tipo, nome_limpo)
+
+        for tipo_grupo in ("Receita", "Despesa"):
+            orfaos_tipo = [
+                reg for reg in registros
+                if not reg["categoria"] and reg["tipo"] == tipo_grupo
+            ]
+            nomes_unicos = list({reg["nome_limpo"] for reg in orfaos_tipo})
+            if not nomes_unicos:
+                continue
+
+            try:
+                for i in range(0, len(nomes_unicos), 50):
+                    chunk = nomes_unicos[i:i+50]
+                    sugestoes = categorizar_batch(
+                        nomes=chunk,
                         taxonomia=taxonomia,
+                        contexto={"tipo": tipo_grupo, "funcao": funcao, "conta": conta},
                     )
-                    categoria = sug["categoria"]
-                    subcategoria = sug["subcategoria"]
-                    classe = sug["classe"]
-                    origem_categoria = "llm"
-                    revisado = False
-                    pendentes += 1
-                except Exception as exc:
-                    import traceback
-                    print(f"LLM ERROR for {nome_limpo}: {type(exc).__name__}: {exc}")
-                    traceback.print_exc()
-                    origem_categoria = "llm_erro"
-                    revisado = False
+                    for s in sugestoes:
+                        mapa_llm[(tipo_grupo, s["nome"])] = s
+            except Exception as exc:
+                import traceback
+                print(f"LLM BATCH ERROR ({tipo_grupo}): {type(exc).__name__}: {exc}")
+                traceback.print_exc()
 
+        for reg in registros:
+            if reg["categoria"]:
+                continue
+            sug = mapa_llm.get((reg["tipo"], reg["nome_limpo"]))
+            if sug:
+                reg["categoria"] = sug.get("categoria", "Outros")
+                reg["subcategoria"] = sug.get("subcategoria", "")
+                reg["classe"] = sug.get("classe", "Variável")
+                reg["origem_categoria"] = "llm"
+                reg["revisado"] = False
+                pendentes += 1
+            else:
+                reg["origem_categoria"] = "llm_erro"
+                reg["revisado"] = False
+
+        # FASE 3: insert
+        for reg in registros:
             id_lancamento = _gerar_id_lancamento(
-                conta, funcao, tipo, data_lancamento, nome_limpo, valor_lancamento, r
+                conta, funcao, reg["tipo"], reg["data_lancamento"],
+                reg["nome_limpo"], reg["valor_lancamento"], reg["linha"],
             )
-
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -175,11 +206,12 @@ def processar_extrato(linhas: list[dict], conta: str) -> dict:
                     returning id_lancamento
                     """,
                     (
-                        id_lancamento, data_lancamento, data_vencimento, conta,
-                        tipo, funcao, classe,
-                        nome_limpo, categoria, subcategoria, descricao,
-                        valor_lancamento, id_recorrencia,
-                        contexto, origem_categoria, revisado,
+                        id_lancamento, reg["data_lancamento"], reg["data_vencimento"], conta,
+                        reg["tipo"], funcao, reg["classe"],
+                        reg["nome_limpo"], reg["categoria"], reg["subcategoria"],
+                        reg["descricao"], reg["valor_lancamento"],
+                        reg["id_recorrencia"],
+                        reg["contexto"], reg["origem_categoria"], reg["revisado"],
                     ),
                 )
                 row = cur.fetchone()
@@ -187,15 +219,15 @@ def processar_extrato(linhas: list[dict], conta: str) -> dict:
                     inseridos += 1
                     detalhes.append({
                         "id_lancamento": id_lancamento,
-                        "nome": nome_limpo,
-                        "valor": valor_lancamento,
-                        "tipo": tipo,
-                        "categoria": categoria,
-                        "subcategoria": subcategoria,
-                        "classe": classe,
-                        "contexto": contexto,
-                        "origem": origem_categoria,
-                        "revisado": revisado,
+                        "nome": reg["nome_limpo"],
+                        "valor": reg["valor_lancamento"],
+                        "tipo": reg["tipo"],
+                        "categoria": reg["categoria"],
+                        "subcategoria": reg["subcategoria"],
+                        "classe": reg["classe"],
+                        "contexto": reg["contexto"],
+                        "origem": reg["origem_categoria"],
+                        "revisado": reg["revisado"],
                     })
                 else:
                     ignorados += 1
