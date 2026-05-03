@@ -72,7 +72,7 @@ def categorizar_batch(
 {_formatar_taxonomia(taxonomia)}
 
 Para cada nome de lançamento abaixo, retorne categoria, subcategoria e classe.
-- classe = "Fixa" se for assinatura/recorrente típica (streaming, plano, mensalidade); senão "Variável".
+- classe = "Variável".
 - Se não souber subcategoria, use "".
 - Se não souber categoria, use "Outros".
 
