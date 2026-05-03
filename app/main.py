@@ -548,6 +548,7 @@ def squad_data():
     Retorna JSON consolidado pros 4 agentes do squad mensal.
     Janela: últimos 35 dias (5 semanas) a partir da data mais recente em fact_lancamento.
     Janela comparativa: 105 dias anteriores ao período (3 períodos de 35d pra trimestre).
+    Desconsiderando Categorias 89 (fatura), 34, 36 (aplicação e resgate de investimentos).
     """
     with pool.connection() as conn:
         # 1. Define janela
@@ -576,7 +577,7 @@ def squad_data():
                        coalesce(sum(valor) filter (where classe = 'Fixa'), 0) as fixa,
                        coalesce(sum(valor) filter (where classe = 'Variável'), 0) as variavel
                 from fact_lancamento
-                where data_lancamento >= %s and data_lancamento <= %s
+                where categoria_id NOT IN (89, 34, 36) and data_lancamento >= %s and data_lancamento <= %s
                 group by tipo
                 """,
                 (out["periodo"]["inicio"], out["periodo"]["fim"]),
@@ -596,7 +597,7 @@ def squad_data():
                          sum(fl.valor) as total_periodo
                   from fact_lancamento fl
                   join dim_categoria dc on dc.id_categoria = fl.categoria_id
-                  where fl.tipo = 'Despesa' and fl.classe != 'Investimento'
+                  where categoria_id NOT IN (89, 34, 36) and fl.tipo = 'Despesa' and fl.classe != 'Investimento'
                     and fl.data_lancamento between %s and %s
                   group by 1, 2
                 ),
@@ -605,7 +606,7 @@ def squad_data():
                          sum(fl.valor) / 3.0 as media_periodo
                   from fact_lancamento fl
                   join dim_categoria dc on dc.id_categoria = fl.categoria_id
-                  where fl.tipo = 'Despesa' and fl.classe != 'Investimento'
+                  where categoria_id NOT IN (89, 34, 36) and fl.tipo = 'Despesa' and fl.classe != 'Investimento'
                     and fl.data_lancamento between %s and %s
                   group by 1, 2
                 )
@@ -636,7 +637,7 @@ def squad_data():
                 from fact_lancamento fl
                 left join dim_categoria dc on dc.id_categoria = fl.categoria_id
                 join dim_account da on da.id_conta = fl.conta_id
-                where fl.tipo = 'Despesa' and fl.classe != 'Investimento'
+                where fl.categoria_id NOT IN (89, 34, 36) and fl.tipo = 'Despesa' and fl.classe != 'Investimento'
                   and fl.data_lancamento between %s and %s
                 order by fl.valor desc
                 limit 10
@@ -660,7 +661,7 @@ def squad_data():
                 from dim_lancamentos_recorrentes dlr
                 left join fact_lancamento fl on fl.id_recorrencia = dlr.id
                   and fl.data_lancamento between %s and %s
-                where dlr.ativo = true
+                where fl.categoria_id NOT IN (89, 34, 36) and dlr.ativo = true
                 group by 1, 2, 3, 4
                 order by total_periodo desc
                 """,
@@ -706,7 +707,7 @@ def squad_data():
                        sum(fl.valor) as total
                 from fact_lancamento fl
                 join dim_categoria dc on dc.id_categoria = fl.categoria_id
-                where fl.tipo = 'Despesa' and fl.classe = 'Variável'
+                where fl.categoria_id NOT IN (89, 34, 36) and fl.tipo = 'Despesa' and fl.classe = 'Variável'
                   and fl.data_lancamento between %s and %s
                 group by 1, 2
                 having count(*) >= 3
