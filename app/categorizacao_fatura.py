@@ -17,7 +17,7 @@ from .llm import sugerir_categoria
 
 def _normalizar_nome(nome: str) -> str:
     nome = re.sub(r"\s+", " ", nome).strip().upper()
-    nome = nome.replace("SAO PAULO BRA", "").strip()
+    nome = nome.replace("SAO PAULO BRA", "").replace("SAO PAULOBRA", "".strip()
     if nome[:18] == "ANUIDADE DIFERENCI":
         nome = "ANUIDADE DIFERENCI"
     return nome
